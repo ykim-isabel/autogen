@@ -3,6 +3,8 @@ from typing import Callable, Dict, List, Optional
 from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
 from autogen.retrieve_utils import get_files_from_dir, split_files_to_chunks, TEXT_FORMATS
 import logging
+import chromadb.utils.embedding_functions as ef
+from qdrant_client.models import SearchRequest
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
         super().__init__(name, human_input_mode, is_termination_msg, retrieve_config, **kwargs)
         self._client = self._retrieve_config.get("client", QdrantClient(":memory:"))
         self._embedding_model = self._retrieve_config.get("embedding_model", "BAAI/bge-small-en-v1.5")
+        self._embedding_function = self._retrieve_config.get("embedding_function", None)
         # Uses all available CPU cores to encode data when set to 0
         self._parallel = self._retrieve_config.get("parallel", 0)
         self._on_disk = self._retrieve_config.get("on_disk", False)
@@ -116,6 +119,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
                 chunk_mode=self._chunk_mode,
                 must_break_at_empty_line=self._must_break_at_empty_line,
                 embedding_model=self._embedding_model,
+                embedding_function=self._embedding_function,
                 custom_text_split_function=self.custom_text_split_function,
                 custom_text_types=self._custom_text_types,
                 recursive=self._recursive,
@@ -135,6 +139,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
             client=self._client,
             collection_name=self._collection_name,
             embedding_model=self._embedding_model,
+            embedding_function=self._embedding_function,
         )
         self._results = results
 
@@ -147,6 +152,7 @@ def create_qdrant_from_dir(
     chunk_mode: str = "multi_lines",
     must_break_at_empty_line: bool = True,
     embedding_model: str = "BAAI/bge-small-en-v1.5",
+    embedding_function: Callable = None,
     custom_text_split_function: Callable = None,
     custom_text_types: List[str] = TEXT_FORMATS,
     recursive: bool = True,
@@ -170,6 +176,7 @@ def create_qdrant_from_dir(
         must_break_at_empty_line (Optional, bool): Whether to break at empty line. Default is True.
         embedding_model (Optional, str): the embedding model to use. Default is "BAAI/bge-small-en-v1.5".
             The list of all the available models can be at https://qdrant.github.io/fastembed/examples/Supported_Models/.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None.
         custom_text_split_function (Optional, Callable): a custom function to split a string into a list of strings.
             Default is None, will use the default function in `autogen.retrieve_utils.split_text_to_chunks`.
         custom_text_types (Optional, List[str]): a list of file types to be processed. Default is TEXT_FORMATS.
@@ -187,8 +194,20 @@ def create_qdrant_from_dir(
     """
     if client is None:
         client = QdrantClient(**qdrant_client_options)
-        client.set_model(embedding_model)
+    try:
+        embedding_function = (
+            ef.SentenceTransformerEmbeddingFunction(embedding_model)
+            if embedding_function is None
+            else embedding_function
+        )
+    except ValueError as e:
+        logger.warning(f"{e}")
 
+    if embedding_function is None:
+        logger.warning(f"TAMERS DEBUG: Using default embedding model {embedding_model}")
+        client.set_model(embedding_model)
+    if embedding_model is None:
+        logger.warning(f"TAMERS DEBUG: embedding_model empty!!!")
     if custom_text_split_function is not None:
         chunks = split_files_to_chunks(
             get_files_from_dir(dir_path, custom_text_types, recursive),
@@ -251,6 +270,7 @@ def query_qdrant(
     collection_name: str = "all-my-documents",
     search_string: str = "",
     embedding_model: str = "BAAI/bge-small-en-v1.5",
+    embedding_function: Callable = None,
     qdrant_client_options: Optional[Dict] = {},
 ) -> List[List[QueryResponse]]:
     """Perform a similarity search with filters on a Qdrant collection
@@ -273,28 +293,62 @@ def query_qdrant(
                 document: str
                 score: float
     """
+    is_vector = True
     if client is None:
         client = QdrantClient(**qdrant_client_options)
-        client.set_model(embedding_model)
-
-    results = client.query_batch(
-        collection_name,
-        query_texts,
-        limit=n_results,
-        query_filter=models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="document",
-                    match=models.MatchText(text=search_string),
-                )
-            ]
-        )
-        if search_string
-        else None,
+        if embedding_function is None:
+            client.set_model(embedding_model)
+            is_vector = False
+        
+    embedding_function = (
+        ef.SentenceTransformerEmbeddingFunction(embedding_model) if embedding_function is None else embedding_function
     )
+    
+    if is_vector:
+        
+        query_embeddings = embedding_function(query_texts)
 
-    data = {
-        "ids": [[result.id for result in sublist] for sublist in results],
-        "documents": [[result.document for result in sublist] for sublist in results],
-    }
-    return data
+        search_queries: List[SearchRequest] = []
+        for embedding in query_embeddings:
+            search_queries.append(
+                SearchRequest(
+                    vector=embedding,
+                    limit=n_results,
+                with_payload=['content', 'meta'],
+                )
+            )
+        
+        results = client.search_batch(
+            collection_name = collection_name,
+            requests=search_queries
+        )
+       
+        data = {
+            "ids": [[scored_point.id for scored_point in batch] for batch in results],
+            "documents": [[scored_point.payload.get('content', '') for scored_point in batch] for batch in results],
+            "metadatas": [[scored_point.payload.get('meta', {}) for scored_point in batch] for batch in results]
+        }
+        return data
+    else:
+        results = client.query_batch(
+            collection_name,
+            query_texts,
+            limit=n_results,
+            query_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document",
+                        match=models.MatchText(text=search_string),
+                    )
+                ]
+            )
+            if search_string
+            else None,
+        )
+        data = {
+            "ids": [[result.id for result in sublist] for sublist in results],
+            "documents": [[result.document for result in sublist] for sublist in results],
+        }
+        return data
+        
+
