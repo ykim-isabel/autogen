@@ -3,6 +3,9 @@ from typing import Callable, Dict, List, Optional
 from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
 from autogen.retrieve_utils import get_files_from_dir, split_files_to_chunks, TEXT_FORMATS
 import logging
+import chromadb.utils.embedding_functions as ef
+from qdrant_client.models import SearchRequest, Filter, FieldCondition, MatchText
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
         super().__init__(name, human_input_mode, is_termination_msg, retrieve_config, **kwargs)
         self._client = self._retrieve_config.get("client", QdrantClient(":memory:"))
         self._embedding_model = self._retrieve_config.get("embedding_model", "BAAI/bge-small-en-v1.5")
+        self._embedding_function = self._retrieve_config.get("embedding_function", None)
         # Uses all available CPU cores to encode data when set to 0
         self._parallel = self._retrieve_config.get("parallel", 0)
         self._on_disk = self._retrieve_config.get("on_disk", False)
@@ -99,7 +103,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
         self._hnsw_config = self._retrieve_config.get("hnsw_config", None)
         self._payload_indexing = self._retrieve_config.get("payload_indexing", False)
 
-    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = "", filter: Filter = None):
         """
         Args:
             problem (str): the problem to be solved.
@@ -116,6 +120,7 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
                 chunk_mode=self._chunk_mode,
                 must_break_at_empty_line=self._must_break_at_empty_line,
                 embedding_model=self._embedding_model,
+                embedding_function=self._embedding_function,
                 custom_text_split_function=self.custom_text_split_function,
                 custom_text_types=self._custom_text_types,
                 recursive=self._recursive,
@@ -127,14 +132,20 @@ class QdrantRetrieveUserProxyAgent(RetrieveUserProxyAgent):
                 payload_indexing=self._payload_indexing,
             )
             self._collection = True
+        # Adding a filter to the class so that it can be updated and persists when retrieving a new context.
+        if filter:
+            self.filter = filter
 
         results = query_qdrant(
-            query_texts=problem,
+            # Need to pass a list even if it's a single string
+            query_texts=[problem],
             n_results=n_results,
             search_string=search_string,
             client=self._client,
             collection_name=self._collection_name,
             embedding_model=self._embedding_model,
+            embedding_function=self._embedding_function,
+            filter=self.filter,
         )
         self._results = results
 
@@ -147,6 +158,7 @@ def create_qdrant_from_dir(
     chunk_mode: str = "multi_lines",
     must_break_at_empty_line: bool = True,
     embedding_model: str = "BAAI/bge-small-en-v1.5",
+    embedding_function: Callable = None,
     custom_text_split_function: Callable = None,
     custom_text_types: List[str] = TEXT_FORMATS,
     recursive: bool = True,
@@ -170,6 +182,7 @@ def create_qdrant_from_dir(
         must_break_at_empty_line (Optional, bool): Whether to break at empty line. Default is True.
         embedding_model (Optional, str): the embedding model to use. Default is "BAAI/bge-small-en-v1.5".
             The list of all the available models can be at https://qdrant.github.io/fastembed/examples/Supported_Models/.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None.
         custom_text_split_function (Optional, Callable): a custom function to split a string into a list of strings.
             Default is None, will use the default function in `autogen.retrieve_utils.split_text_to_chunks`.
         custom_text_types (Optional, List[str]): a list of file types to be processed. Default is TEXT_FORMATS.
@@ -187,8 +200,19 @@ def create_qdrant_from_dir(
     """
     if client is None:
         client = QdrantClient(**qdrant_client_options)
-        client.set_model(embedding_model)
+    try:
+        embedding_function = (
+            ef.get_embedding_function(embedding_model) if embedding_function is None else embedding_function
+        )
 
+    except ValueError as e:
+        logger.warning(f"{e}")
+
+    if embedding_function is None:
+        logger.debug(f"No embedding function supplied, using default embedding model {embedding_model}")
+        client.set_model(embedding_model)
+    if embedding_model is None:
+        logger.warning("Neither embedding_function nor embedding_model are specified!")
     if custom_text_split_function is not None:
         chunks = split_files_to_chunks(
             get_files_from_dir(dir_path, custom_text_types, recursive),
@@ -251,7 +275,9 @@ def query_qdrant(
     collection_name: str = "all-my-documents",
     search_string: str = "",
     embedding_model: str = "BAAI/bge-small-en-v1.5",
+    embedding_function: Callable = None,
     qdrant_client_options: Optional[Dict] = {},
+    filter: Optional[Filter] = None,
 ) -> List[List[QueryResponse]]:
     """Perform a similarity search with filters on a Qdrant collection
 
@@ -273,28 +299,61 @@ def query_qdrant(
                 document: str
                 score: float
     """
+
+    is_vector = True
     if client is None:
         client = QdrantClient(**qdrant_client_options)
-        client.set_model(embedding_model)
+        if embedding_function is None:
+            client.set_model(embedding_model)
+            is_vector = False
 
-    results = client.query_batch(
-        collection_name,
-        query_texts,
-        limit=n_results,
-        query_filter=models.Filter(
+    embedding_function = (
+        ef.SentenceTransformerEmbeddingFunction(embedding_model) if embedding_function is None else embedding_function
+    )
+    # search_string uses MatchText to look in the full-text, to match meta data use MatchValue
+    if not filter and search_string != "":
+        filter = Filter(
             must=[
-                models.FieldCondition(
-                    key="document",
-                    match=models.MatchText(text=search_string),
+                FieldCondition(
+                    key="content",
+                    match=MatchText(
+                        text=search_string,
+                    ),
                 )
             ]
         )
-        if search_string
-        else None,
-    )
 
-    data = {
-        "ids": [[result.id for result in sublist] for sublist in results],
-        "documents": [[result.document for result in sublist] for sublist in results],
-    }
-    return data
+    if is_vector:
+        # Check that query_texts is a list of strings and not a single string
+        if isinstance(query_texts, str):
+            raise ValueError(
+                "query_texts should be a list of strings, not a single string, maybe did you pass it in the wrong format?"
+            )
+        query_embeddings = embedding_function(query_texts)
+
+        search_queries: List[SearchRequest] = []
+        for embedding in query_embeddings:
+            search_queries.append(
+                SearchRequest(
+                    vector=embedding,
+                    filter=filter,
+                    limit=n_results,
+                    with_payload=["content", "meta"],
+                )
+            )
+
+        results = client.search_batch(collection_name=collection_name, requests=search_queries)
+
+        data = {
+            "ids": [[scored_point.id for scored_point in batch] for batch in results],
+            "documents": [[scored_point.payload.get("content", "") for scored_point in batch] for batch in results],
+            "metadatas": [[scored_point.payload.get("meta", {}) for scored_point in batch] for batch in results],
+        }
+        return data
+    else:
+        results = client.query_batch(collection_name, query_texts, limit=n_results, query_filter=filter)
+        data = {
+            "ids": [[result.id for result in sublist] for sublist in results],
+            "documents": [[result.document for result in sublist] for sublist in results],
+        }
+        return data

@@ -340,7 +340,10 @@ class RetrieveUserProxyAgent(UserProxyAgent):
                     for _tmp_retrieve_count in range(1, 5):
                         self._reset(intermediate=True)
                         self.retrieve_docs(
-                            self.problem, self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                            self.problem,
+                            self.n_results * (2 * _tmp_retrieve_count + 1),
+                            self._search_string,
+                            filter=self.filter,
                         )
                         doc_contents = self._get_context(self._results)
                         if doc_contents:
@@ -351,7 +354,10 @@ class RetrieveUserProxyAgent(UserProxyAgent):
                 for _tmp_retrieve_count in range(5):
                     self._reset(intermediate=True)
                     self.retrieve_docs(
-                        _intermediate_info[0], self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                        _intermediate_info[0],
+                        self.n_results * (2 * _tmp_retrieve_count + 1),
+                        self._search_string,
+                        filter=self.filter,
                     )
                     self._get_context(self._results)
                     doc_contents = "\n".join(self._doc_contents)  # + "\n" + "\n".join(self._intermediate_answers)
@@ -364,7 +370,7 @@ class RetrieveUserProxyAgent(UserProxyAgent):
         else:
             return False, None
 
-    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = "", filter=None):
         """Retrieve docs based on the given problem and assign the results to the class property `_results`.
         In case you want to customize the retrieval process, such as using a different vector db whose APIs are not
         compatible with chromadb or filter results with metadata, you can override this function. Just keep the current
@@ -414,7 +420,7 @@ class RetrieveUserProxyAgent(UserProxyAgent):
         self._results = results
         print("doc_ids: ", results["ids"])
 
-    def generate_init_message(self, problem: str, n_results: int = 20, search_string: str = ""):
+    def generate_init_message(self, problem: str, n_results: int = 20, search_string: str = "", filter=None):
         """Generate an initial message with the given problem and prompt.
 
         Args:
@@ -426,7 +432,7 @@ class RetrieveUserProxyAgent(UserProxyAgent):
             str: the generated prompt ready to be sent to the assistant agent.
         """
         self._reset()
-        self.retrieve_docs(problem, n_results, search_string)
+        self.retrieve_docs(problem, n_results, search_string, filter)
         self.problem = problem
         self.n_results = n_results
         doc_contents = self._get_context(self._results)
